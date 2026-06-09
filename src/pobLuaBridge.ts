@@ -61,15 +61,17 @@ export class PoBLuaApiClient {
     const isWindows = process.platform === 'win32';
     const luaExt = isWindows ? 'dll' : 'so';
 
-    // On Windows, use semicolons and backslashes; on Unix, use colons and forward slashes
-    const pathSep = isWindows ? ';' : ':';
+    // Lua's package.path/cpath list separator is ';' on ALL platforms
+    // (it is not the OS PATH separator). Using ':' on Unix produces one
+    // giant invalid template and silently breaks module loading.
+    const luaSep = ';';
 
     const env = {
       ...process.env,
       ...this.options.env,
       POB_API_STDIO: "1",
-      LUA_PATH: `${runtimeLuaPath}${path.sep}?.lua${pathSep}${runtimeLuaPath}${path.sep}?${path.sep}init.lua${pathSep}${pathSep}`,
-      LUA_CPATH: `${runtimeDir}${path.sep}?.${luaExt}${pathSep}${luaRocksPath}${path.sep}?.${luaExt}${pathSep}${pathSep}`,
+      LUA_PATH: `${runtimeLuaPath}${path.sep}?.lua${luaSep}${runtimeLuaPath}${path.sep}?${path.sep}init.lua${luaSep}${luaSep}`,
+      LUA_CPATH: `${runtimeDir}${path.sep}?.${luaExt}${luaSep}${luaRocksPath}${path.sep}?.${luaExt}${luaSep}${luaSep}`,
     } as NodeJS.ProcessEnv;
 
     try {
