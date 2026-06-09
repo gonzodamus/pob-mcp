@@ -259,7 +259,13 @@ export async function handleCompareBuilds(context: HandlerContext, build1Name: s
       }
     } catch { /* ignore */ }
 
-    const stats = await luaClient.getStats();
+    // The default Lua stat export has no player DPS fields, so request them explicitly
+    const stats = await luaClient.getStats([
+      'Life', 'EnergyShield', 'TotalEHP', 'Mana',
+      'TotalDPS', 'CombinedDPS', 'FullDPS', 'AverageDamage',
+      'CritChance', 'CritMultiplier',
+      'FireResist', 'ColdResist', 'LightningResist', 'ChaosResist',
+    ]);
     return { stats, selectedSpec, selectedItemSet, displayName };
   };
 
@@ -267,15 +273,35 @@ export async function handleCompareBuilds(context: HandlerContext, build1Name: s
   let luaOk = false;
   let r1: any = null;
   let r2: any = null;
+  let originalXml: string | null = null;
+  let originalName = 'Restored Build';
+  let restored = false;
   try {
     await context.ensureLuaClient();
     const luaClient = context.getLuaClient();
     if (luaClient) {
+      // Snapshot whatever is currently loaded so the comparison has no side effects
+      try {
+        originalXml = await luaClient.exportBuildXml();
+        const info = await luaClient.getBuildInfo();
+        if (info?.buildName) originalName = String(info.buildName);
+      } catch { /* nothing loaded — nothing to restore */ }
+
       r1 = await loadEndgame(luaClient, build1Name);
       r2 = await loadEndgame(luaClient, build2Name);
       luaOk = true;
     }
   } catch { /* fall through to XML */ }
+
+  if (originalXml) {
+    const luaClient = context.getLuaClient();
+    if (luaClient) {
+      try {
+        await luaClient.loadBuildXml(originalXml, originalName);
+        restored = true;
+      } catch { /* leave whatever is loaded; reported in output below */ }
+    }
+  }
 
   if (luaOk && r1 && r2) {
     const fmtNum = (n: any) =>
@@ -339,7 +365,11 @@ export async function handleCompareBuilds(context: HandlerContext, build1Name: s
     lines.push(row('Chaos Resist %', s1.ChaosResist, s2.ChaosResist));
     lines.push('');
 
-    lines.push(`Note: "${r2.displayName}" is now active in the Lua bridge.`);
+    lines.push(
+      restored
+        ? `Note: previously loaded build ("${originalName}") was restored in the Lua bridge.`
+        : `Note: "${r2.displayName}" is now active in the Lua bridge.`
+    );
 
     return { content: [{ type: 'text' as const, text: lines.join('\n') }] };
   }

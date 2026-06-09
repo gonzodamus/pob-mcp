@@ -32,7 +32,9 @@
       "mcp__pob__lua_start",
       "mcp__pob__lua_load_build",
       "mcp__pob__get_equipped_items",
-      "mcp__pob__lua_stop"
+      "mcp__pob__lua_stop",
+      "Bash(git -C /Users/dick/Code/pob-mcp remote -v)",
+      "Bash(git -C /Users/dick/Code/pob-mcp diff main...bridgefix --stat)"
     ],
     "deny": [],
     "ask": []
