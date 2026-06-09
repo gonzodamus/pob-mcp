@@ -2,6 +2,19 @@ import { spawn, ChildProcessWithoutNullStreams } from "child_process";
 import { EventEmitter } from "events";
 import path from "path";
 import os from "os";
+import { XMLParser } from "fast-xml-parser";
+
+// Class/ascendancy id mappings (PoE1), used by the XML fallbacks below
+const CLASS_NAMES = ["Scion", "Marauder", "Ranger", "Witch", "Duelist", "Templar", "Shadow"];
+const ASCEND_NAMES: Record<number, string[]> = {
+  0: ["None", "Ascendant"],
+  1: ["None", "Juggernaut", "Berserker", "Chieftain"],
+  2: ["None", "Raider", "Deadeye", "Pathfinder"],
+  3: ["None", "Occultist", "Elementalist", "Necromancer"],
+  4: ["None", "Slayer", "Gladiator", "Champion"],
+  5: ["None", "Inquisitor", "Hierophant", "Guardian"],
+  6: ["None", "Assassin", "Trickster", "Saboteur"],
+};
 
 /** Lua bridge request envelope */
 type LuaRequest = { action: string; params?: Record<string, unknown> };
@@ -433,6 +446,19 @@ async setTree(params: {
     if (!res.ok) throw new Error(res.error || "set_gem_enabled failed");
   }
 
+  async runExperiments(params: {
+    experiments: Array<Record<string, unknown>>;
+    fields?: string[];
+    useFullDPS?: boolean;
+  }): Promise<{ baseline: Record<string, number>; results: Array<Record<string, any>> }> {
+    const res = await this.send({ action: "run_experiments", params });
+    if (!res.ok) throw new Error(res.error || "run_experiments failed");
+    return {
+      baseline: res.baseline as Record<string, number>,
+      results: res.results as Array<Record<string, any>>,
+    };
+  }
+
   async searchNodes(params: { keyword: string; nodeType?: string; maxResults?: number; includeAllocated?: boolean }): Promise<any> {
     const res = await this.send({ action: "search_nodes", params });
     if (!res.ok) throw new Error(res.error || "search_nodes failed");
@@ -457,46 +483,176 @@ async setTree(params: {
     return res.result;
   }
 
+  // ---------------------------------------------------------------------
+  // Spec / item-set operations.
+  //
+  // The connected PoB API build has no Lua handlers for these actions
+  // (Server.lua answers "unknown action"), so each method tries the action
+  // first and falls back to a TS-side implementation that round-trips the
+  // build XML via export_build_xml / load_build_xml.
+  // ---------------------------------------------------------------------
+
+  private xmlFallbackParser: XMLParser | null = null;
+
+  private parseBuildXml(xml: string): any {
+    if (!this.xmlFallbackParser) {
+      this.xmlFallbackParser = new XMLParser({ ignoreAttributes: false, attributeNamePrefix: "" });
+    }
+    return this.xmlFallbackParser.parse(xml);
+  }
+
+  private static isUnknownAction(err: unknown): boolean {
+    return err instanceof Error && err.message.includes("unknown action");
+  }
+
+  private async loadedBuildName(): Promise<string> {
+    try {
+      const info = await this.getBuildInfo();
+      return String(info?.buildName ?? info?.name ?? "Build");
+    } catch {
+      return "Build";
+    }
+  }
+
+  private specsFromXml(xml: string): { specs: any[]; activeSpec: number } {
+    const tree = this.parseBuildXml(xml)?.PathOfBuilding?.Tree;
+    const specsRaw = tree?.Spec ? (Array.isArray(tree.Spec) ? tree.Spec : [tree.Spec]) : [];
+    const activeSpec = Number(tree?.activeSpec ?? 1);
+    const specs = specsRaw.map((s: any, i: number) => {
+      const classId = Number(s.classId ?? 0);
+      const ascendClassId = Number(s.ascendClassId ?? 0);
+      const nodesAttr = s.nodes != null ? String(s.nodes) : "";
+      return {
+        index: i + 1,
+        title: s.title ?? `Spec ${i + 1}`,
+        className: CLASS_NAMES[classId] ?? "Unknown",
+        ascendClassName: ASCEND_NAMES[classId]?.[ascendClassId] ?? (ascendClassId === 0 ? "None" : "Unknown"),
+        nodeCount: nodesAttr ? nodesAttr.split(",").filter(Boolean).length : 0,
+        treeVersion: s.treeVersion,
+        active: i + 1 === activeSpec,
+      };
+    });
+    return { specs, activeSpec };
+  }
+
+  private itemSetsFromXml(xml: string): { itemSets: any[]; activeItemSetId: number } {
+    const items = this.parseBuildXml(xml)?.PathOfBuilding?.Items;
+    const setsRaw = items?.ItemSet ? (Array.isArray(items.ItemSet) ? items.ItemSet : [items.ItemSet]) : [];
+    const activeItemSetId = Number(items?.activeItemSet ?? 1);
+    const itemSets = setsRaw.map((s: any) => ({
+      id: Number(s.id),
+      title: s.title ?? `Item Set ${s.id}`,
+      useSecondWeaponSet: String(s.useSecondWeaponSet) === "true",
+      active: Number(s.id) === activeItemSetId,
+    }));
+    return { itemSets, activeItemSetId };
+  }
+
   async createSpec(params?: { title?: string; copyFrom?: number; activate?: boolean }): Promise<any> {
     const res = await this.send({ action: "create_spec", params: params || {} });
-    if (!res.ok) throw new Error(res.error || "create_spec failed");
+    if (!res.ok) {
+      if (res.error?.includes("unknown action")) {
+        throw new Error("create_spec is not supported by the connected PoB API build. Create the spec in PoB and reload the build.");
+      }
+      throw new Error(res.error || "create_spec failed");
+    }
     return res.result;
   }
 
   async listSpecs(): Promise<any> {
-    const res = await this.send({ action: "list_specs" });
-    if (!res.ok) throw new Error(res.error || "list_specs failed");
-    return res.result;
+    try {
+      const res = await this.send({ action: "list_specs" });
+      if (!res.ok) throw new Error(res.error || "list_specs failed");
+      return res.result;
+    } catch (err) {
+      if (!PoBLuaApiClient.isUnknownAction(err)) throw err;
+      // XML fallback
+      const xml = await this.exportBuildXml();
+      return this.specsFromXml(xml);
+    }
   }
 
   async selectSpec(index: number): Promise<any> {
-    const res = await this.send({ action: "select_spec", params: { index } });
-    if (!res.ok) throw new Error(res.error || "select_spec failed");
-    return res.result;
+    try {
+      const res = await this.send({ action: "select_spec", params: { index } });
+      if (!res.ok) throw new Error(res.error || "select_spec failed");
+      return res.result;
+    } catch (err) {
+      if (!PoBLuaApiClient.isUnknownAction(err)) throw err;
+      // XML fallback: rewrite Tree.activeSpec and reload the build
+      const xml = await this.exportBuildXml();
+      const { specs } = this.specsFromXml(xml);
+      if (index < 1 || index > specs.length) {
+        throw new Error(`Spec index ${index} out of range (build has ${specs.length} specs).`);
+      }
+      let newXml: string;
+      if (/<Tree\b[^>]*\bactiveSpec="/.test(xml)) {
+        newXml = xml.replace(/(<Tree\b[^>]*\bactiveSpec=")\d+(")/, `$1${index}$2`);
+      } else {
+        newXml = xml.replace(/<Tree\b/, `<Tree activeSpec="${index}"`);
+      }
+      await this.loadBuildXml(newXml, await this.loadedBuildName());
+      return this.specsFromXml(newXml);
+    }
   }
 
   async deleteSpec(index: number): Promise<any> {
     const res = await this.send({ action: "delete_spec", params: { index } });
-    if (!res.ok) throw new Error(res.error || "delete_spec failed");
+    if (!res.ok) {
+      if (res.error?.includes("unknown action")) {
+        throw new Error("delete_spec is not supported by the connected PoB API build. Delete the spec in PoB and reload the build.");
+      }
+      throw new Error(res.error || "delete_spec failed");
+    }
     return res.result;
   }
 
   async renameSpec(index: number, title: string): Promise<any> {
     const res = await this.send({ action: "rename_spec", params: { index, title } });
-    if (!res.ok) throw new Error(res.error || "rename_spec failed");
+    if (!res.ok) {
+      if (res.error?.includes("unknown action")) {
+        throw new Error("rename_spec is not supported by the connected PoB API build. Rename the spec in PoB and reload the build.");
+      }
+      throw new Error(res.error || "rename_spec failed");
+    }
     return res.result;
   }
 
   async listItemSets(): Promise<any> {
-    const res = await this.send({ action: "list_item_sets" });
-    if (!res.ok) throw new Error(res.error || "list_item_sets failed");
-    return res.result;
+    try {
+      const res = await this.send({ action: "list_item_sets" });
+      if (!res.ok) throw new Error(res.error || "list_item_sets failed");
+      return res.result;
+    } catch (err) {
+      if (!PoBLuaApiClient.isUnknownAction(err)) throw err;
+      // XML fallback
+      const xml = await this.exportBuildXml();
+      return this.itemSetsFromXml(xml);
+    }
   }
 
   async selectItemSet(id: number): Promise<any> {
-    const res = await this.send({ action: "select_item_set", params: { id } });
-    if (!res.ok) throw new Error(res.error || "select_item_set failed");
-    return res.result;
+    try {
+      const res = await this.send({ action: "select_item_set", params: { id } });
+      if (!res.ok) throw new Error(res.error || "select_item_set failed");
+      return res.result;
+    } catch (err) {
+      if (!PoBLuaApiClient.isUnknownAction(err)) throw err;
+      // XML fallback: rewrite Items.activeItemSet and reload the build
+      const xml = await this.exportBuildXml();
+      const { itemSets } = this.itemSetsFromXml(xml);
+      if (!itemSets.some((s) => s.id === id)) {
+        throw new Error(`Item set ${id} not found (available: ${itemSets.map((s) => s.id).join(", ") || "none"}).`);
+      }
+      let newXml: string;
+      if (/<Items\b[^>]*\bactiveItemSet="/.test(xml)) {
+        newXml = xml.replace(/(<Items\b[^>]*\bactiveItemSet=")\d+(")/, `$1${id}$2`);
+      } else {
+        newXml = xml.replace(/<Items\b/, `<Items activeItemSet="${id}"`);
+      }
+      await this.loadBuildXml(newXml, await this.loadedBuildName());
+      return this.itemSetsFromXml(newXml);
+    }
   }
 
   async stop(): Promise<void> {

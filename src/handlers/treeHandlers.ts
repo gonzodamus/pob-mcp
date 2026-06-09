@@ -13,6 +13,8 @@ export interface TreeHandlerContext {
 export interface PassiveUpgradesContext {
   getLuaClient: () => PoBLuaApiClient | null;
   ensureLuaClient: () => Promise<void>;
+  /** When provided, candidate notables are scored including travel-node path cost */
+  treeService?: TreeService;
 }
 
 export async function handleCompareTrees(
@@ -412,19 +414,46 @@ export async function handleGetPassiveUpgrades(
     };
   }
 
-  // Step 4: simulate each candidate with calcWith
+  // Step 4: resolve travel-node path costs so distant notables aren't over-credited.
+  // Falls back to single-node simulation (cost 1, no travel nodes) if tree data
+  // is unavailable.
+  let treeData: any = null;
+  let allocatedSet: Set<string> | null = null;
+  if (context.treeService) {
+    try {
+      const treeResult = await luaClient.getTree();
+      const allocated = (treeResult.nodes || []).map(String);
+      if (allocated.length > 0) {
+        allocatedSet = new Set<string>(allocated);
+        treeData = await context.treeService.getTreeData(treeResult.treeVersion || undefined);
+      }
+    } catch { /* path costs unavailable — score single nodes */ }
+  }
+
+  // Step 5: simulate each candidate with calcWith, including its travel path
   interface ScoredNode {
     node: any;
     dpsDelta: number;
     ehpDelta: number;
     score: number;
+    cost: number;
+    scorePerPoint: number;
   }
 
   const scored: ScoredNode[] = [];
 
   for (const node of candidates) {
     try {
-      const out = await luaClient.calcWith({ addNodes: [node.id] });
+      let pathNodes: string[] = [String(node.id)];
+      let cost = 1;
+      if (treeData && allocatedSet && context.treeService) {
+        const paths = context.treeService.findShortestPaths(allocatedSet, String(node.id), treeData, 1);
+        if (paths.length === 0) continue; // unreachable from current tree
+        pathNodes = paths[0].nodes;
+        cost = Math.max(1, paths[0].cost);
+      }
+
+      const out = await luaClient.calcWith({ addNodes: pathNodes.map(Number) });
       if (!out) continue;
 
       // calcWith returns raw Lua output; minion stats are nested under out.Minion
@@ -446,26 +475,31 @@ export async function handleGetPassiveUpgrades(
         score = (dpsDelta / baseDPS) + (ehpDelta / baseEHP);
       }
 
-      scored.push({ node, dpsDelta, ehpDelta, score });
+      scored.push({ node, dpsDelta, ehpDelta, score, cost, scorePerPoint: score / cost });
     } catch { /* skip nodes that fail calcWith */ }
   }
 
-  // Step 5: sort and return top N
-  scored.sort((a, b) => b.score - a.score);
+  // Step 6: rank by gain per passive point and return top N
+  scored.sort((a, b) => b.scorePerPoint - a.scorePerPoint);
   const top = scored.slice(0, maxResults);
 
+  const pathAware = treeData != null && allocatedSet != null;
   const textLines: string[] = [
     `=== Passive Upgrades (focus: ${focus}) ===`,
     '',
     `Base DPS: ${Math.round(baseDPS).toLocaleString()}  |  Base EHP: ${Math.round(baseEHP).toLocaleString()}`,
-    `Evaluated ${candidates.length} candidate notables, showing top ${top.length}:`,
+    pathAware
+      ? `Evaluated ${candidates.length} candidate notables including travel-node cost, ranked by gain per point:`
+      : `Evaluated ${candidates.length} candidate notables (⚠ travel cost unavailable — deltas assume the notable alone):`,
     '',
   ];
 
   for (let i = 0; i < top.length; i++) {
-    const { node, dpsDelta, ehpDelta, score } = top[i];
+    const { node, dpsDelta, ehpDelta, score, cost, scorePerPoint } = top[i];
     textLines.push(`${i + 1}. **${node.name}** [${node.id}]`);
-    let scoreLine = `   Score: ${score.toFixed(4)}`;
+    let scoreLine = pathAware
+      ? `   Cost: ${cost} point${cost !== 1 ? 's' : ''}  |  Gain/point: ${scorePerPoint.toFixed(4)}  |  Total: ${score.toFixed(4)}`
+      : `   Score: ${score.toFixed(4)}`;
     if (dpsDelta !== 0) scoreLine += `  |  DPS Δ: ${dpsDelta > 0 ? '+' : ''}${Math.round(dpsDelta).toLocaleString()}`;
     if (ehpDelta !== 0) scoreLine += `  |  EHP Δ: ${ehpDelta > 0 ? '+' : ''}${Math.round(ehpDelta).toLocaleString()}`;
     textLines.push(scoreLine);
@@ -480,7 +514,7 @@ export async function handleGetPassiveUpgrades(
   if (top.length === 0) {
     textLines.push('No results after simulation. Try a different focus or ensure a build is loaded.');
   } else {
-    textLines.push('', '💡 Use lua_set_tree to allocate the top node and recalculate stats.');
+    textLines.push('', '💡 DPS/EHP deltas include the full travel path. Use find_path_to_node for the allocation order, then lua_set_tree to allocate.');
   }
 
   return {

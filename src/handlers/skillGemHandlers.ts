@@ -2,6 +2,7 @@ import type { BuildService } from "../services/buildService.js";
 import type { SkillGemService } from "../services/skillGemService.js";
 import type { PoBLuaApiClient } from "../pobLuaBridge.js";
 import { wrapHandler } from "../utils/errorHandling.js";
+import { isMoreMultiplier, isPenetration } from "../data/gemClassification.js";
 
 export interface SkillGemHandlerContext {
   buildService: BuildService;
@@ -26,7 +27,8 @@ export async function handleAnalyzeSkillLinks(
   }
 
   const buildData = await buildService.readBuild(args.build_name);
-  const skillIndex = args.skill_index || 0;
+  // Default to the build's main socket group, not the first group
+  const skillIndex = args.skill_index ?? skillGemService.getMainSkillIndex(buildData);
 
   const analysis = skillGemService.analyzeSkillLinks(buildData, skillIndex);
 
@@ -113,7 +115,8 @@ export async function handleSuggestSupportGems(
   }
 
   const buildData = await buildService.readBuild(args.build_name);
-  const skillIndex = args.skill_index || 0;
+  // Default to the build's main socket group, not the first group
+  const skillIndex = args.skill_index ?? skillGemService.getMainSkillIndex(buildData);
 
   const suggestions = skillGemService.suggestSupportGems(buildData, skillIndex, {
     count: args.count,
@@ -192,16 +195,22 @@ export async function handleSuggestSupportGems(
 
 /**
  * Handle compare_gem_setups tool call
+ *
+ * Measured path: each setup is applied to the target socket group via
+ * run_experiments (swap_gem/add_gem/remove_gem ops, auto-reverted) and the
+ * computed DPS deltas are reported. Falls back to structural analysis when
+ * the Lua bridge is unavailable.
  */
 export async function handleCompareGemSetups(
   context: SkillGemHandlerContext,
   args: {
     build_name: string;
     skill_index?: number;
+    group_index?: number;
     setups: Array<{ name: string; gems: string[] }>;
   }
 ) {
-  const { buildService, pobDirectory, getLuaClient, ensureLuaClient } = context;
+  const { buildService } = context;
 
   if (!args.build_name) {
     throw new Error("build_name is required");
@@ -211,42 +220,165 @@ export async function handleCompareGemSetups(
     throw new Error("At least 2 setups are required for comparison");
   }
 
-  const buildData = await buildService.readBuild(args.build_name);
+  // Try the measured path first
+  try {
+    const measured = await compareGemSetupsMeasured(context, args);
+    if (measured) return measured;
+  } catch (err) {
+    // Fall through to structural analysis, but tell the user why
+    const reason = err instanceof Error ? err.message : String(err);
+    return structuralGemComparison(await buildService.readBuild(args.build_name), context, args,
+      `Lua bridge measurement failed (${reason}). Showing structural analysis only.`);
+  }
 
-  // Get active skill name for context
+  return structuralGemComparison(await buildService.readBuild(args.build_name), context, args,
+    'Lua bridge not available. Showing structural analysis only — start it with lua_load_build for measured DPS deltas.');
+}
+
+const COMPARISON_FIELDS = ['TotalDPS', 'CombinedDPS', 'TotalDot', 'Life', 'EnergyShield', 'TotalEHP'];
+
+/**
+ * Measured comparison via run_experiments. Returns null when no Lua bridge is configured.
+ */
+async function compareGemSetupsMeasured(
+  context: SkillGemHandlerContext,
+  args: {
+    build_name: string;
+    group_index?: number;
+    setups: Array<{ name: string; gems: string[] }>;
+  }
+) {
+  if (!context.ensureLuaClient || !context.getLuaClient) return null;
+  await context.ensureLuaClient();
+  const luaClient = context.getLuaClient();
+  if (!luaClient) return null;
+
+  // Make sure the requested build is the one loaded in the bridge
+  const requestedName = args.build_name.replace(/\.xml$/i, '').split(/[/\\]/).pop() ?? args.build_name;
+  let loadedName: string | undefined;
+  try {
+    const info = await luaClient.getBuildInfo();
+    loadedName = info?.buildName ? String(info.buildName) : (info?.name ? String(info.name) : undefined);
+  } catch { /* nothing loaded yet */ }
+  if (loadedName !== requestedName && context.pobDirectory) {
+    const fs = await import('fs/promises');
+    const path = await import('path');
+    const xml = await fs.readFile(path.join(context.pobDirectory, args.build_name), 'utf-8');
+    await luaClient.loadBuildXml(xml, requestedName);
+  }
+
+  const skills = await luaClient.getSkills();
+  const groups: any[] = skills?.groups ?? [];
+  const groupIndex = args.group_index ?? skills?.mainSocketGroup ?? 1;
+  const group = groups.find((g) => g.index === groupIndex);
+  if (!group) {
+    throw new Error(`Socket group ${groupIndex} not found (build has ${groups.length} groups). Load the right build with lua_load_build.`);
+  }
+
+  const currentGems: Array<{ index: number; name: string }> = (group.gems ?? []).map(
+    (g: any, i: number) => ({ index: g.index ?? i + 1, name: g.name ?? String(g) })
+  );
+
+  // Build per-setup op lists transforming the current group into the setup
+  const experiments = args.setups.map((setup) => {
+    const ops: Array<Record<string, unknown>> = [];
+    const target = setup.gems;
+    const common = Math.min(currentGems.length, target.length);
+
+    for (let i = 0; i < common; i++) {
+      if (currentGems[i].name !== target[i]) {
+        ops.push({ type: 'swap_gem', groupIndex, gemIndex: currentGems[i].index, gemName: target[i] });
+      }
+    }
+    // Remove surplus gems from the end so earlier indices stay stable
+    for (let i = currentGems.length - 1; i >= target.length; i--) {
+      ops.push({ type: 'remove_gem', groupIndex, gemIndex: currentGems[i].index });
+    }
+    // Add extra gems at sensible defaults
+    for (let i = currentGems.length; i < target.length; i++) {
+      ops.push({ type: 'add_gem', groupIndex, gemName: target[i], level: 20, quality: 20 });
+    }
+
+    return { name: setup.name, ops };
+  });
+
+  const { baseline, results } = await luaClient.runExperiments({
+    experiments,
+    fields: COMPARISON_FIELDS,
+  });
+
+  const dpsOf = (stats: Record<string, any> | undefined) =>
+    Number(stats?.CombinedDPS) || Number(stats?.TotalDPS) || Number(stats?.TotalDot) || 0;
+
+  const baseDPS = dpsOf(baseline);
+  const activeSkillName = group.skills?.[0] ?? currentGems.find((g) => !g.name.includes('Support'))?.name ?? 'Unknown Skill';
+
+  const outputLines: string[] = [
+    `=== Gem Setup Comparison for ${activeSkillName} (group ${groupIndex}) ===`,
+    '',
+    `Current gems: ${currentGems.map((g) => g.name).join(', ')}`,
+    `Baseline DPS: ${Math.round(baseDPS).toLocaleString()}`,
+    '',
+  ];
+
+  // Rank successful setups by measured DPS
+  const ranked = results
+    .map((r, i) => ({ r, setup: args.setups[i] }))
+    .sort((a, b) => (a.r.ok && b.r.ok ? dpsOf(b.r.stats) - dpsOf(a.r.stats) : a.r.ok ? -1 : 1));
+
+  for (let rank = 0; rank < ranked.length; rank++) {
+    const { r, setup } = ranked[rank];
+    outputLines.push(`${rank + 1}. "${setup.name}" (${setup.gems.length}-link)`);
+    outputLines.push(`   Gems: ${setup.gems.join(', ')}`);
+    if (r.ok) {
+      const dps = dpsOf(r.stats);
+      const delta = dps - baseDPS;
+      const pct = baseDPS > 0 ? ` (${delta >= 0 ? '+' : ''}${((delta / baseDPS) * 100).toFixed(1)}%)` : '';
+      outputLines.push(`   Measured DPS: ${Math.round(dps).toLocaleString()} | Δ vs current: ${delta >= 0 ? '+' : ''}${Math.round(delta).toLocaleString()}${pct}`);
+      const ehp = Number(r.stats?.TotalEHP);
+      const baseEHP = Number(baseline?.TotalEHP);
+      if (ehp && baseEHP && Math.round(ehp) !== Math.round(baseEHP)) {
+        outputLines.push(`   EHP: ${Math.round(ehp).toLocaleString()} (${ehp >= baseEHP ? '+' : ''}${Math.round(ehp - baseEHP).toLocaleString()})`);
+      }
+    } else {
+      outputLines.push(`   ⚠ Measurement failed: ${r.error ?? 'unknown error'}`);
+    }
+    outputLines.push('');
+  }
+
+  outputLines.push('All setups were measured in PoB and reverted — the loaded build is unchanged.');
+  outputLines.push('Note: added gems were simulated at 20/20; socket colors and gem availability are not checked.');
+
+  return { content: [{ type: 'text' as const, text: outputLines.join('\n') }] };
+}
+
+/**
+ * Structural fallback when no measurement is possible.
+ */
+function structuralGemComparison(
+  buildData: any,
+  context: SkillGemHandlerContext,
+  args: { build_name: string; skill_index?: number; setups: Array<{ name: string; gems: string[] }> },
+  reason: string
+) {
   const skills = extractSkills(buildData);
-  const skillIndex = args.skill_index || 0;
-  const activeSkillName = skills[skillIndex]?.gems[0]?.nameSpec || "Unknown Skill";
+  const skillIndex = args.skill_index ?? context.skillGemService.getMainSkillIndex(buildData);
+  const skillGems = skills[skillIndex]?.gems ?? [];
+  const activeSkillName =
+    skillGems.find((g: any) => !String(g.nameSpec || '').includes('Support'))?.nameSpec || 'Unknown Skill';
 
   const outputLines: string[] = [
     `=== Gem Setup Comparison for ${activeSkillName} ===`,
     '',
-    'NOTE: Live DPS simulation per-setup is not yet supported (gem-swap requires PoB API extension).',
-    'Showing structural analysis of each setup.',
+    `NOTE: ${reason}`,
     '',
   ];
-
-  // Known "more" multiplier support gems
-  const MORE_MULTIPLIERS = new Set([
-    'Controlled Destruction', 'Elemental Focus', 'Concentrated Effect',
-    'Multistrike', 'Faster Attacks', 'Faster Casting', 'Spell Echo',
-    'Brutality', 'Void Manipulation', 'Swift Affliction', 'Efficacy',
-    'Empower', 'Intensify', 'Infused Channelling', 'Close Combat',
-    'Exceptional Controlled Destruction', 'Exceptional Elemental Focus',
-    'Exceptional Void Manipulation', 'Exceptional Brutality',
-    'Exceptional Swift Affliction', 'Exceptional Efficacy',
-  ]);
-  const PENETRATION_GEMS = new Set([
-    'Fire Penetration', 'Cold Penetration', 'Lightning Penetration',
-    'Combustion', 'Energy Leech', 'Ice Bite',
-    'Exceptional Fire Penetration', 'Exceptional Cold Penetration', 'Exceptional Lightning Penetration',
-  ]);
 
   for (let i = 0; i < args.setups.length; i++) {
     const setup = args.setups[i];
     const letter = String.fromCharCode(65 + i);
-    const moreCount = setup.gems.filter(g => MORE_MULTIPLIERS.has(g)).length;
-    const hasPen = setup.gems.some(g => PENETRATION_GEMS.has(g));
+    const moreCount = setup.gems.filter((g) => isMoreMultiplier(g)).length;
+    const hasPen = setup.gems.some((g) => isPenetration(g));
 
     outputLines.push(`Setup ${letter}: "${setup.name}"`);
     outputLines.push(`  Gems (${setup.gems.length}-link): ${setup.gems.join(", ")}`);
@@ -258,15 +390,11 @@ export async function handleCompareGemSetups(
     outputLines.push(penLine, '');
   }
 
-  outputLines.push('=== Note ===');
-  outputLines.push('For accurate DPS comparison, use add_gem + lua_get_stats to manually test each setup.');
-  const output = outputLines.join('\n');
-
   return {
     content: [
       {
         type: "text" as const,
-        text: output,
+        text: outputLines.join('\n'),
       },
     ],
   };
@@ -371,7 +499,8 @@ export async function handleFindOptimalLinks(
   }
 
   const buildData = await buildService.readBuild(args.build_name);
-  const skillIndex = args.skill_index || 0;
+  // Default to the build's main socket group, not the first group
+  const skillIndex = args.skill_index ?? skillGemService.getMainSkillIndex(buildData);
 
   const analysis = skillGemService.analyzeSkillLinks(buildData, skillIndex);
   const suggestions = skillGemService.suggestSupportGems(buildData, skillIndex, {

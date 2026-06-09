@@ -4,6 +4,8 @@
  * Analyzes skill gem setups and suggests improvements for optimal damage/utility.
  */
 
+import { isMoreMultiplier, isPenetration, isClearSpeed, isBossing } from './data/gemClassification.js';
+
 export interface SkillGem {
   name: string;
   level?: number;
@@ -120,95 +122,6 @@ const SUPPORT_RECOMMENDATIONS: Record<string, string[]> = {
     'Enhance Support',
   ],
 };
-
-/**
- * Support gems that provide multiplicative ("more") damage bonuses.
- * These are the primary way to scale DPS — far stronger per slot than "increased" supports.
- * An exceptional main skill should have at least 2–3 "more" multipliers in its 6-link.
- */
-const MORE_MULTIPLIER_GEMS = new Set([
-  'controlled destruction support',
-  'elemental focus support',
-  'multistrike support',
-  'spell echo support',
-  'swift affliction support',
-  'efficacy support',
-  'minion damage support',
-  'concentrated effect support',
-  'brutality support',
-  'deadly ailments support',
-  'vile toxins support',
-  'impale support',
-  'melee physical damage support',
-  'added fire damage support',
-  'close combat support',
-  'increased critical damage support',
-  'cruelty support',
-  'void manipulation support',
-  'hypothermia support',
-  'trap and mine damage support',
-  'multiple totems support',
-  'Exceptional controlled destruction support',
-  'Exceptional elemental focus support',
-  'Exceptional spell echo support',
-  'Exceptional brutality support',
-  'Exceptional swift affliction support',
-  'Exceptional deadly ailments support',
-  'Exceptional void manipulation support',
-  'Exceptional minion damage support',
-  'Exceptional added fire damage support',
-  'Exceptional melee physical damage support',
-]);
-
-/**
- * Support gems that reduce enemy resistances or provide damage penetration.
- * Penetration is critical against high-resistance bosses (Shaper, Elder, Ubers).
- * An elemental skill without penetration loses ~33-50% effective DPS vs endgame bosses.
- */
-const PENETRATION_GEMS = new Set([
-  'fire penetration support',
-  'cold penetration support',
-  'lightning penetration support',
-  'elemental penetration support',
-  'combustion support',  // reduces enemy fire resist on ignite
-  'hypothermia support', // cold exposure
-  'storm brand',         // lightning exposure via some interactions
-  'void manipulation support',
-  'Exceptional fire penetration support',
-  'Exceptional cold penetration support',
-  'Exceptional lightning penetration support',
-  'Exceptional void manipulation support',
-]);
-
-/**
- * Support gems primarily useful for clear speed (AoE, projectile proliferation).
- */
-const CLEAR_SPEED_GEMS = new Set([
-  'greater multiple projectiles support',
-  'Exceptional greater multiple projectiles support',
-  'chain support',
-  'fork support',
-  'Exceptional fork support',
-  'pierce support',
-  'volley support',
-  'lesser multiple projectiles support',
-  'spell cascade support',
-  'Exceptional spell cascade support',
-  'reap support',
-]);
-
-/**
- * Support gems primarily useful for single-target / bossing DPS.
- */
-const BOSSING_GEMS = new Set([
-  'concentrated effect support',
-  'Exceptional concentrated effect support',
-  'barrage support',
-  'Exceptional added fire damage support',
-  'Exceptional deadly ailments support',
-  'Exceptional vile toxins support',
-  'empower support',
-]);
 
 /**
  * Detect skill type from gem name
@@ -331,16 +244,16 @@ function analyzeSkillGroup(
   const supportNames = supports.map((s) => s.name.toLowerCase());
 
   // Count "more" multiplier supports
-  const moreMultiplierCount = supports.filter((s) => MORE_MULTIPLIER_GEMS.has(s.name.toLowerCase())).length;
+  const moreMultiplierCount = supports.filter((s) => isMoreMultiplier(s.name)).length;
   analysis.moreMultiplierCount = moreMultiplierCount;
 
   // Detect penetration
-  const hasPenetration = supports.some((s) => PENETRATION_GEMS.has(s.name.toLowerCase()));
+  const hasPenetration = supports.some((s) => isPenetration(s.name));
   analysis.hasPenetration = hasPenetration;
 
   // Detect clear speed vs bossing balance
-  const hasClearGem = supports.some((s) => CLEAR_SPEED_GEMS.has(s.name.toLowerCase()));
-  const hasBossingGem = supports.some((s) => BOSSING_GEMS.has(s.name.toLowerCase()));
+  const hasClearGem = supports.some((s) => isClearSpeed(s.name));
+  const hasBossingGem = supports.some((s) => isBossing(s.name));
 
   // Flag missing "more" multipliers on main skill — this is the #1 DPS lever in PoE
   if (group.isMainSkill && supports.length >= 2 && moreMultiplierCount === 0) {

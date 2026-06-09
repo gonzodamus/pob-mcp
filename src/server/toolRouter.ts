@@ -18,7 +18,7 @@ import { handleStartWatching, handleStopWatching, handleGetRecentChanges, handle
 import { handleCompareTrees, handleGetNearbyNodes, handleFindPath, handleGetPassiveUpgrades, handleSuggestMasteries } from "../handlers/treeHandlers.js";
 import { handleGetBuildIssues, formatIssuesResponse } from "../handlers/buildGoalsHandlers.js";
 import { handleLuaStart, handleLuaStop, handleLuaNewBuild, handleLuaSaveBuild, handleLuaLoadBuild, handleLuaGetStats, handleLuaGetTree, handleLuaSetTree, handleSearchTreeNodes, handleLuaGetBuildInfo, handleLuaReloadBuild, handleUpdateTreeDelta, handleCreateSpec, handleListSpecs, handleSelectSpec, handleDeleteSpec, handleRenameSpec, handleListItemSets, handleSelectItemSet } from "../handlers/luaHandlers.js";
-import { handleAddItem, handleGetEquippedItems, handleToggleFlask, handleGetSkillSetup, handleSetMainSkill, handleCreateSocketGroup, handleAddGem, handleSetGemLevel, handleSetGemQuality, handleRemoveSkill, handleRemoveGem, handleSetupSkillWithGems, handleAddMultipleItems, handleSetSocketGroupEnabled, handleSetGemEnabled } from "../handlers/itemSkillHandlers.js";
+import { handleAddItem, handleGetEquippedItems, handleToggleFlask, handleGetSkillSetup, handleSetMainSkill, handleCreateSocketGroup, handleAddGem, handleSetGemLevel, handleSetGemQuality, handleRemoveSkill, handleRemoveGem, handleSetupSkillWithGems, handleAddMultipleItems, handleSetSocketGroupEnabled, handleSetGemEnabled, handleRunExperiments } from "../handlers/itemSkillHandlers.js";
 import { handleAnalyzeDefenses, handleSuggestOptimalNodes, handleOptimizeTree } from "../handlers/optimizationHandlers.js";
 import { handleAnalyzeItems, handleOptimizeSkillLinks, handleCreateBudgetBuild } from "../handlers/advancedOptimizationHandlers.js";
 import { handleGetConfig, handleSetConfig, handleSetEnemyStats, handleSaveConfigPreset, handleLoadConfigPreset, handleListConfigPresets } from "../handlers/configHandlers.js";
@@ -340,6 +340,15 @@ export async function routeToolCall(
       if (!args) throw new Error("Missing arguments");
       return await handleSetGemEnabled(itemSkillContext, args.group_index as number, args.gem_index as number, args.enabled as boolean);
 
+    case "run_experiments":
+      if (!args) throw new Error("Missing arguments");
+      return await handleRunExperiments(
+        itemSkillContext,
+        args.experiments as Array<Record<string, unknown>>,
+        args.fields as string[] | undefined,
+        args.use_full_dps as boolean | undefined
+      );
+
     case "setup_skill_with_gems": {
       if (!args) throw new Error("Missing arguments");
       // Schema exposes active_gem (string) + support_gems (string[]), build the gems array here
@@ -480,6 +489,7 @@ export async function routeToolCall(
       return await handleCompareGemSetups(skillGemContext, {
         build_name: args.build_name as string,
         skill_index: args.skill_index as number | undefined,
+        group_index: args.group_index as number | undefined,
         setups: args.setups as Array<{ name: string; gems: string[] }>,
       });
 
@@ -678,6 +688,7 @@ export async function routeToolCall(
       const upgradesContext = {
         getLuaClient: deps.getLuaClient,
         ensureLuaClient: deps.ensureLuaClient,
+        treeService: deps.contextBuilder.buildTreeContext().treeService,
       };
       const focus = (args?.focus as 'dps' | 'defence' | 'both') || 'both';
       const maxResults = (args?.max_results as number) || 10;

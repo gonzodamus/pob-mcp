@@ -714,6 +714,40 @@ export function getLuaToolSchemas(): any[] {
       },
     },
     {
+      name: "run_experiments",
+      description: "Run a batch of what-if experiments against the loaded build in a single call, returning stat deltas vs the current baseline. Each experiment is applied, calculated, and fully reverted — the build is never left modified. Far cheaper than mutate/check/revert tool sequences.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          experiments: {
+            type: "array",
+            description:
+              "Experiments to evaluate. Each is either a single op object, or { name, ops: [op, ...] } to combine ops. Op types (all indices 1-based): " +
+              "{ type: 'set_gem_level', groupIndex, gemIndex, level } | " +
+              "{ type: 'set_gem_quality', groupIndex, gemIndex, quality } | " +
+              "{ type: 'set_gem_enabled', groupIndex, gemIndex, enabled } | " +
+              "{ type: 'set_socket_group_enabled', groupIndex, enabled } | " +
+              "{ type: 'swap_gem', groupIndex, gemIndex, gemName } | " +
+              "{ type: 'add_gem', groupIndex, gemName, level?, quality? } | " +
+              "{ type: 'remove_gem', groupIndex, gemIndex } | " +
+              "{ type: 'add_nodes', nodes: [id, ...] } | " +
+              "{ type: 'remove_nodes', nodes: [id, ...] }",
+            items: { type: "object" },
+          },
+          fields: {
+            type: "array",
+            description: "Optional stat fields to report (default: Life, EnergyShield, TotalEHP, DPS stats, resists)",
+            items: { type: "string" },
+          },
+          use_full_dps: {
+            type: "boolean",
+            description: "Calculate using Full DPS (all enabled skills) instead of the main skill",
+          },
+        },
+        required: ["experiments"],
+      },
+    },
+    {
       name: "setup_skill_with_gems",
       description: "Setup a complete skill with multiple support gems in one operation. Does NOT auto-set as main skill for DPS. Call set_main_skill with the returned group_index afterward if this should be the primary DPS skill.",
       inputSchema: {
@@ -1070,7 +1104,7 @@ export function getSkillGemToolSchemas(): any[] {
           },
           skill_index: {
             type: "number",
-            description: "Which skill to analyze (0 = main skill, default: 0)",
+            description: "0-based skill index (default: the build's main socket group)",
           },
         },
         required: ["build_name"],
@@ -1088,7 +1122,7 @@ export function getSkillGemToolSchemas(): any[] {
           },
           skill_index: {
             type: "number",
-            description: "Which skill to optimize (0 = main skill, default: 0)",
+            description: "0-based skill index (default: the build's main socket group)",
           },
           count: {
             type: "number",
@@ -1108,7 +1142,7 @@ export function getSkillGemToolSchemas(): any[] {
     },
     {
       name: "compare_gem_setups",
-      description: "Compare multiple gem configurations side-by-side to evaluate different options. NOTE: Full DPS comparison requires Lua bridge integration (future enhancement).",
+      description: "Compare multiple gem configurations with measured DPS deltas. Each setup is applied to the socket group in PoB via run_experiments and reverted, so the loaded build is unchanged. Falls back to structural analysis if the Lua bridge is unavailable.",
       inputSchema: {
         type: "object",
         properties: {
@@ -1116,9 +1150,13 @@ export function getSkillGemToolSchemas(): any[] {
             type: "string",
             description: "Build to test",
           },
+          group_index: {
+            type: "number",
+            description: "Socket group to test, 1-based (default: the build's main socket group)",
+          },
           skill_index: {
             type: "number",
-            description: "Which skill to test (default: 0)",
+            description: "Structural-fallback only: 0-based skill index (default: main socket group)",
           },
           setups: {
             type: "array",
@@ -1169,7 +1207,7 @@ export function getSkillGemToolSchemas(): any[] {
           },
           skill_index: {
             type: "number",
-            description: "Which skill to optimize (default: 0)",
+            description: "0-based skill index (default: the build's main socket group)",
           },
           link_count: {
             type: "number",

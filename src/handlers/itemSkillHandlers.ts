@@ -636,6 +636,63 @@ export async function handleSetGemEnabled(
   });
 }
 
+export async function handleRunExperiments(
+  context: ItemSkillHandlerContext,
+  experiments: Array<Record<string, unknown>>,
+  fields?: string[],
+  useFullDPS?: boolean
+) {
+  return wrapHandler('run experiments', async () => {
+    await context.ensureLuaClient();
+
+    const luaClient = context.getLuaClient();
+    if (!luaClient) {
+      throw new Error('Lua client not initialized. Use lua_start first.');
+    }
+
+    if (!Array.isArray(experiments) || experiments.length === 0) {
+      throw new Error('experiments must be a non-empty array');
+    }
+
+    const { baseline, results } = await luaClient.runExperiments({ experiments, fields, useFullDPS });
+
+    const fmt = (n: number) => {
+      const rounded = Math.abs(n) >= 100 ? Math.round(n) : Math.round(n * 10) / 10;
+      return rounded.toLocaleString();
+    };
+
+    const lines: string[] = ['=== Experiment Results (build unchanged) ===', '', 'Baseline:'];
+    for (const [k, v] of Object.entries(baseline)) {
+      if (typeof v === 'number' && v !== 0) lines.push(`  ${k.padEnd(22)}${fmt(v).padStart(14)}`);
+    }
+
+    for (const r of results) {
+      lines.push('', `--- ${r.name} ---`);
+      if (!r.ok) {
+        lines.push(`  ❌ ${r.error ?? 'failed'}`);
+        continue;
+      }
+      const deltas = Object.entries(r.deltas ?? {})
+        .filter(([, d]) => typeof d === 'number' && Math.abs(d as number) > 0.005)
+        .sort(([, a], [, b]) => Math.abs(b as number) - Math.abs(a as number));
+      if (deltas.length === 0) {
+        lines.push('  No stat changes vs baseline.');
+        continue;
+      }
+      for (const [k, d] of deltas) {
+        const delta = d as number;
+        const sign = delta > 0 ? '+' : '';
+        const pct = baseline[k] ? ` (${sign}${((delta / baseline[k]) * 100).toFixed(1)}%)` : '';
+        lines.push(`  ${k.padEnd(22)}${(sign + fmt(delta)).padStart(14)}${pct}`);
+      }
+    }
+
+    return {
+      content: [{ type: "text" as const, text: lines.join('\n') }],
+    };
+  });
+}
+
 export async function handleSetupSkillWithGems(
   context: ItemSkillHandlerContext,
   gems: Array<{

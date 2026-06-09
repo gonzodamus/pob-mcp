@@ -76,20 +76,36 @@ export class SkillGemService {
   }
 
   /**
+   * Resolve the default skill index from the build's mainSocketGroup.
+   * PoB stores mainSocketGroup as a 1-based index into the active skill set's
+   * socket groups; extractSkills preserves that ordering via originalIndex.
+   */
+  getMainSkillIndex(build: PoBBuild): number {
+    const mainSocketGroup = Number((build as any).Build?.mainSocketGroup);
+    if (!Number.isFinite(mainSocketGroup) || mainSocketGroup < 1) return 0;
+
+    const skills = this.extractSkills(build);
+    const idx = skills.findIndex((s) => s.originalIndex === mainSocketGroup - 1);
+    return idx >= 0 ? idx : 0;
+  }
+
+  /**
    * Analyze a skill's gem setup
    */
   analyzeSkillLinks(
     build: PoBBuild,
-    skillIndex: number = 0
+    skillIndex?: number
   ): GemAnalysis {
     const skills = this.extractSkills(build);
-    if (skillIndex >= skills.length) {
-      throw new Error(`Skill index ${skillIndex} not found. Build has ${skills.length} skills.`);
+    const resolvedIndex = skillIndex ?? this.getMainSkillIndex(build);
+    if (resolvedIndex >= skills.length) {
+      throw new Error(`Skill index ${resolvedIndex} not found. Build has ${skills.length} skills.`);
     }
 
-    const skill = skills[skillIndex];
-    const activeGem = skill.gems[0]; // First gem is usually active skill
-    const supportGems = skill.gems.slice(1);
+    const skill = skills[resolvedIndex];
+    // The active skill is the first non-support gem — supports can be socketed first
+    const activeGem = skill.gems.find((g) => !this.isSupportGem(g)) ?? skill.gems[0];
+    const supportGems = skill.gems.filter((g) => g !== activeGem);
 
     // Detect archetype
     const archetype = this.detectArchetype(activeGem, build);
@@ -122,7 +138,7 @@ export class SkillGemService {
    */
   suggestSupportGems(
     build: PoBBuild,
-    skillIndex: number = 0,
+    skillIndex?: number,
     options: {
       count?: number;
       includeExceptional?: boolean;
@@ -267,28 +283,46 @@ export class SkillGemService {
   }
 
   /**
-   * Extract skills from build
+   * Check whether a parsed gem entry is a support gem
    */
-  private extractSkills(build: PoBBuild): Array<{ gems: any[]; slot: string }> {
-    const skills: Array<{ gems: any[]; slot: string }> = [];
+  private isSupportGem(gem: any): boolean {
+    const name = String(gem.nameSpec || gem.gemId || "");
+    const skillId = String(gem.skillId || "");
+    return name.includes("Support") || skillId.includes("Support");
+  }
+
+  /**
+   * Extract skills from the build's active skill set.
+   * originalIndex is the 0-based position within the skill set's socket group
+   * list (including groups without Gem children), so it lines up with PoB's
+   * 1-based mainSocketGroup.
+   */
+  private extractSkills(build: PoBBuild): Array<{ gems: any[]; slot: string; originalIndex: number }> {
+    const skills: Array<{ gems: any[]; slot: string; originalIndex: number }> = [];
 
     if (build.Skills?.SkillSet) {
       const skillSets = Array.isArray(build.Skills.SkillSet)
         ? build.Skills.SkillSet
         : [build.Skills.SkillSet];
 
-      for (const skillSet of skillSets) {
-        if (skillSet.Skill) {
-          const skillArray = Array.isArray(skillSet.Skill) ? skillSet.Skill : [skillSet.Skill];
+      const activeSkillSetId = String((build.Skills as any)?.activeSkillSet ?? "1");
+      const activeSkillSet =
+        skillSets.find((ss: any) => String(ss.id) === activeSkillSetId) ?? skillSets[0];
 
-          for (const skill of skillArray) {
-            if (skill.Gem) {
-              const gems = Array.isArray(skill.Gem) ? skill.Gem : [skill.Gem];
-              skills.push({
-                gems,
-                slot: skill.slot || "Unknown",
-              });
-            }
+      if (activeSkillSet?.Skill) {
+        const skillArray = Array.isArray(activeSkillSet.Skill)
+          ? activeSkillSet.Skill
+          : [activeSkillSet.Skill];
+
+        for (let i = 0; i < skillArray.length; i++) {
+          const skill = skillArray[i];
+          if (skill.Gem) {
+            const gems = Array.isArray(skill.Gem) ? skill.Gem : [skill.Gem];
+            skills.push({
+              gems,
+              slot: skill.slot || "Unknown",
+              originalIndex: i,
+            });
           }
         }
       }
